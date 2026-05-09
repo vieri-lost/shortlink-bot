@@ -1,162 +1,348 @@
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const sqlite3 = require('sqlite3').verbose();
+import telebot
+import requests
+import sqlite3
+import re
 
-const token = process.env.BOT_TOKEN;
-const apiKey = process.env.API_KEY;
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
-const bot = new TelegramBot(token, { polling: true });
+# =====================================
+# CONFIG
+# =====================================
+import os
 
-const db = new sqlite3.Database('./shortlink.db');
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TINY_API_KEY = os.getenv("TINY_API_KEY")
 
-db.run(`
+bot = telebot.TeleBot(BOT_TOKEN)
+
+headers = {
+    "Authorization": f"Bearer {TINY_API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# =====================================
+# DATABASE
+# =====================================
+db = sqlite3.connect("data.db", check_same_thread=False)
+cursor = db.cursor()
+
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    original TEXT,
-    short TEXT,
-    clicks INTEGER DEFAULT 0
+    alias TEXT,
+    short_url TEXT
 )
-`);
+""")
 
-function isUrl(text) {
-    return text.startsWith('http://') || text.startsWith('https://');
-}
+db.commit()
 
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(
-        msg.chat.id,
-        `🤖 Bot Shortlink Aktif
+# =====================================
+# USER STATE
+# =====================================
+user_state = {}
 
-Kirim:
-• 1 link
-• atau banyak link sekaligus
+# =====================================
+# MENU
+# =====================================
+def menu():
 
-Contoh:
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
 
-https://google.com
-https://youtube.com`
-    );
-});
+    markup.row(
+        KeyboardButton("🔗 Shortlink")
+    )
 
-bot.on('message', async (msg) => {
-    if (!msg.text || msg.text.startsWith('/')) return;
+    markup.row(
+        KeyboardButton("📜 Riwayat"),
+        KeyboardButton("🗑 Delete Link")
+    )
 
-    const chatId = msg.chat.id;
+    return markup
 
-    const lines = msg.text
-        .split('\n')
-        .map(v => v.trim())
-        .filter(v => isUrl(v));
+# =====================================
+# START
+# =====================================
+@bot.message_handler(commands=['start'])
+def start(message):
 
-    if (lines.length < 1) {
-        return bot.sendMessage(chatId, '❌ Link tidak valid');
-    }
+    user_state[message.chat.id] = None
 
-    bot.sendMessage(chatId, '⏳ Membuat shortlink...');
+    bot.send_message(
+        message.chat.id,
+        "Selamat datang di TinyURL Bot",
+        reply_markup=menu()
+    )
 
-    let result = '';
+# =====================================
+# SHORTLINK BUTTON
+# =====================================
+@bot.message_handler(func=lambda m: m.text == "🔗 Shortlink")
+def shortlink_button(message):
 
-    for (const link of lines) {
-        try {
-            const res = await axios.post(
-                'https://shortten.net/api/url/add',
-                {
-                    url: link
-                },
-                {
-                    headers: {
-                        'x-api-key': apiKey
-                    }
-                }
-            );
+    user_state[message.chat.id] = "short"
 
-            const short = res.data.shortenedUrl || 'gagal';
+    bot.send_message(
+        message.chat.id,
+        "Kirim 1 atau banyak link.\n\n1 link per baris."
+    )
 
-            db.run(
-                `INSERT INTO links(user_id, original, short)
-                 VALUES(?,?,?)`,
-                [msg.from.id, link, short]
-            );
+# =====================================
+# HISTORY BUTTON
+# =====================================
+@bot.message_handler(func=lambda m: m.text == "📜 Riwayat")
+def history(message):
 
-            result += `🔗 ${short}\n\n`;
+    user_state[message.chat.id] = None
 
-        } catch (e) {
-            result += `❌ Gagal: ${link}\n\n`;
-        }
-    }
+    cursor.execute(
+        """
+        SELECT short_url, alias
+        FROM links
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (message.from_user.id,)
+    )
 
-    bot.sendMessage(chatId, result);
-});
+    rows = cursor.fetchall()
 
-bot.onText(/\/history/, (msg) => {
-    db.all(
-        `SELECT * FROM links
-         WHERE user_id=?
-         ORDER BY id DESC`,
-        [msg.from.id],
-        (err, rows) => {
+    if not rows:
 
-            if (!rows || rows.length < 1) {
-                return bot.sendMessage(
-                    msg.chat.id,
-                    '📂 Belum ada riwayat'
-                );
+        bot.send_message(
+            message.chat.id,
+            "Belum ada riwayat"
+        )
+
+        return
+
+    text = "📜 Riwayat Link\n\n"
+
+    for i, row in enumerate(rows, start=1):
+
+        shorturl = row[0]
+        alias = row[1]
+
+        hits = 0
+
+        try:
+
+            r = requests.get(
+                f"https://api.tinyurl.com/alias/{alias}",
+                headers=headers
+            )
+
+            data = r.json()
+
+            if r.status_code == 200:
+                hits = data["data"].get("hits", 0)
+
+        except:
+            pass
+
+        text += (
+            f"{i}. {shorturl}\n"
+            f"👆 Klik: {hits}\n\n"
+        )
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+# =====================================
+# DELETE MENU
+# =====================================
+@bot.message_handler(func=lambda m: m.text == "🗑 Delete Link")
+def delete_menu(message):
+
+    cursor.execute(
+        """
+        SELECT short_url
+        FROM links
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (message.from_user.id,)
+    )
+
+    rows = cursor.fetchall()
+
+    if not rows:
+
+        bot.send_message(
+            message.chat.id,
+            "Belum ada link"
+        )
+
+        return
+
+    text = "🗑 Delete Link\n\n"
+
+    for i, row in enumerate(rows, start=1):
+
+        text += f"{i}. {row[0]}\n\n"
+
+    text += "Kirim nomor link yang ingin dihapus"
+
+    user_state[message.chat.id] = "delete"
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+# =====================================
+# HANDLE ALL INPUT
+# =====================================
+@bot.message_handler(func=lambda m: True)
+def handle(message):
+
+    state = user_state.get(message.chat.id)
+
+    # =================================
+    # SHORTLINK MODE
+    # =================================
+    if state == "short":
+
+        text = message.text.strip()
+
+        # ambil semua link
+        urls = text.splitlines()
+
+        results = []
+
+        for long_url in urls:
+
+            long_url = long_url.strip()
+
+            # validasi URL
+            if not re.match(r"^https?://", long_url):
+                continue
+
+            payload = {
+                "url": long_url,
+                "domain": "tinyurl.com"
             }
 
-            let text = '📂 Riwayat Link\n\n';
+            try:
 
-            rows.forEach((row, i) => {
-                text +=
-`${i + 1}. ${row.short}
-📊 Klik: ${row.clicks}
+                r = requests.post(
+                    "https://api.tinyurl.com/create",
+                    json=payload,
+                    headers=headers
+                )
 
-`;
-            });
+                data = r.json()
 
-            text +=
-`Hapus link:
- /delete nomor
+                if r.status_code == 200:
 
-Contoh:
- /delete 1`;
+                    shorturl = data["data"]["tiny_url"]
+                    alias = data["data"]["alias"]
 
-            bot.sendMessage(msg.chat.id, text);
-        }
-    );
-});
+                    # simpan database
+                    cursor.execute(
+                        """
+                        INSERT INTO links (user_id, alias, short_url)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            message.from_user.id,
+                            alias,
+                            shorturl
+                        )
+                    )
 
-bot.onText(/\/delete (.+)/, (msg, match) => {
+                    db.commit()
 
-    const nomor = parseInt(match[1]);
+                    results.append(shorturl)
 
-    db.all(
-        `SELECT * FROM links
-         WHERE user_id=?
-         ORDER BY id DESC`,
-        [msg.from.id],
-        (err, rows) => {
+            except:
+                pass
 
-            if (!rows[nomor - 1]) {
-                return bot.sendMessage(
-                    msg.chat.id,
-                    '❌ Nomor tidak ditemukan'
-                );
-            }
+        user_state[message.chat.id] = None
 
-            const id = rows[nomor - 1].id;
+        if results:
 
-            db.run(
-                `DELETE FROM links WHERE id=?`,
-                [id]
-            );
+            text_result = "✅ Shortlink Berhasil\n\n"
 
-            bot.sendMessage(
-                msg.chat.id,
-                '✅ Link berhasil dihapus'
-            );
-        }
-    );
-});
+            for i, link in enumerate(results, start=1):
 
-console.log('Bot running...');
+                text_result += f"{i}. {link}\n\n"
+
+            bot.send_message(
+                message.chat.id,
+                text_result,
+                reply_markup=menu()
+            )
+
+        else:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Tidak ada link valid",
+                reply_markup=menu()
+            )
+
+    # =================================
+    # DELETE MODE
+    # =================================
+    elif state == "delete":
+
+        try:
+
+            nomor = int(message.text)
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM links
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT 10
+                """,
+                (message.from_user.id,)
+            )
+
+            rows = cursor.fetchall()
+
+            if nomor < 1 or nomor > len(rows):
+
+                bot.send_message(
+                    message.chat.id,
+                    "Nomor tidak valid"
+                )
+
+                return
+
+            db_id = rows[nomor - 1][0]
+
+            cursor.execute(
+                "DELETE FROM links WHERE id=?",
+                (db_id,)
+            )
+
+            db.commit()
+
+            user_state[message.chat.id] = None
+
+            bot.send_message(
+                message.chat.id,
+                "✅ Link berhasil dihapus",
+                reply_markup=menu()
+            )
+
+        except:
+
+            bot.send_message(
+                message.chat.id,
+                "Masukkan nomor yang valid"
+            )
+
+# =====================================
+# RUN BOT
+# =====================================
+print("Bot aktif...")
+bot.infinity_polling()
